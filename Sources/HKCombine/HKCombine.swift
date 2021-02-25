@@ -14,36 +14,36 @@ public enum HKCombineError: Error {
 
 extension HKWorkout {
     
-    public var workoutWithDetails: AnyPublisher<HKWorkoutCombineDetails, Error> {
+    public var workoutWithDetails: AnyPublisher<HKCWorkoutDetails, Error> {
         
-        let locationsSamplesPublisher = workoutRouteSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], Error> in
+        let locationsSamplesPublisher = routeSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], Error> in
             workoutRoute.locationsSubject
         })
 //        .replaceEmpty(with: [])
-        .scan([], { (locations, newLocations) -> [CLLocation] in
-            locations + newLocations
-        }).last()
+        /// Given a start value of an empty array
+        .scan([]) { $0 + $1 }
+        /// After combining all the values in a final array get the latest item which will have all the locations combined
+        .last()
+        /// Sort samples in ascending order
         .map({ locationSamples -> [CLLocation] in
-            locationSamples.sorted(by: { (loc1, loc2) -> Bool in
-                loc1.timestamp <= loc2.timestamp
-            })
+            locationSamples.sorted(by: { $0.timestamp <= $1.timestamp })
         })
-        
-        /// Combine the
-        return Publishers.CombineLatest(locationsSamplesPublisher, workoutHeartRateSubject)
-            .map({ (locationSamples, heartRateSamples) -> HKWorkoutCombineDetails in
-                HKWorkoutCombineDetails(workout: self, locations: locationSamples, heartRate: heartRateSamples)
+        /// Subscribe to two publishers, location and heart rate, and producing a tuple upon receiving output from any of the publishers.
+        return Publishers.CombineLatest(locationsSamplesPublisher, heartRateSubject)
+            .map({ (locationSamples, heartRateSamples) -> HKCWorkoutDetails in
+                /// Once both taks have finished publish a HKCWorkoutDetails object downstream
+                HKCWorkoutDetails(workout: self, locations: locationSamples, heartRate: heartRateSamples)
             }).eraseToAnyPublisher()
     }
     
     /// Query a workout together with workout route samples
-    private var workoutRouteSubject:  PassthroughSubject<HKWorkoutRoute, Error> {
+    private var routeSubject:  PassthroughSubject<HKWorkoutRoute, Error> {
         
         let subject = PassthroughSubject<HKWorkoutRoute, Error>()
         
-        let workoutPredicate = HKQuery.predicateForObjects(from: self)
+        let predicate = HKQuery.predicateForObjects(from: self)
         
-        let query = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, routes, error) in
+        let query = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, routes, error) in
             
             guard let routes = routes as? [HKWorkoutRoute], error == nil else {
                 subject.send(completion: .failure(error!))
@@ -60,7 +60,7 @@ extension HKWorkout {
         return subject
     }
     
-    private var workoutHeartRateSubject: AnyPublisher<[HKQuantitySample], Error> {
+    private var heartRateSubject: AnyPublisher<[HKQuantitySample], Error> {
         
         let subject = PassthroughSubject<[HKQuantitySample], Error>()
         
@@ -100,7 +100,7 @@ extension HKWorkout {
 }
 
 /// Relevant data from a HKWorkout including samples
-public struct HKWorkoutCombineDetails: Hashable {
+public struct HKCWorkoutDetails: Hashable {
     
     public let id = UUID()
     /// The actual workout
@@ -161,7 +161,7 @@ private protocol HKHealthStoreCombine {
     
     func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date) -> AnyPublisher<[HKWorkout], Error>
     
-    func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKWorkoutCombineDetails, Error>
+    func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, Error>
     
     func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
 }
@@ -199,13 +199,16 @@ extension HKHealthStore: HKHealthStoreCombine {
     /// Requests permission to save and read the specified data types
     /// - Parameters:
     ///   - types: A set containing the data types to share or read.
-    ///   - toShare: A `Bool` indicating if the `types` `Set` can create and save these data types to the HealthKit store.
-    ///   - toRead: A `Bool` indicating if the `types` `Set` can read these data types to the HealthKit store.
+    ///   - toShare: `Bool` indicating if the `types` `Set` can create and save these data types to the HealthKit store.
+    ///   - toRead:`Bool` indicating if the `types` `Set` can read these data types to the HealthKit store.
     /// - Returns: A publisher that emits a `Bool` when the authorization process finishes
     public func authorize(types: Set<HKSampleType>, toShare: Bool = true, toRead: Bool = true) -> AnyPublisher<Bool, HKCombineError> {
         
         let subject = PassthroughSubject<Bool, HKCombineError>()
         
+        /// - `Bool`: Indicates whether the request was processed successfully. Doesn't indicate whether the
+        ///          permission was actually granted.
+        /// - `Error`:  `nil` if an error hasn't ocurred
         let callback: (Bool, Error?) -> () = { result, error in
             
             guard error == nil else {
@@ -222,6 +225,40 @@ extension HKHealthStore: HKHealthStoreCombine {
         }
         
         HKHealthStore().requestAuthorization(toShare: toShare ? types : nil, read: toRead ? types : nil) { (result, error) in
+            /// Won't be called until the system's HealthKit permission has ended
+            callback(result, error)
+        }
+        
+        return subject.eraseToAnyPublisher()
+    }
+    
+    /// Checks whether the system presents the user with a permission sheet if your app requests authorization for the provided types.
+    /// - Parameters:
+    ///   - types: A set containing the data types to share or read.
+    ///   - toShare: `Bool` indicating if the `types` `Set` can create and save these data types to the HealthKit store.
+    ///   - toRead:`Bool` indicating if the `types` `Set` can read these data types to the HealthKit store.
+    /// - Returns: `true` if it needs to request permissions for the given `types`, otherwise `false`.
+    public func needsToAuthorize(types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
+        
+        let subject = PassthroughSubject<Bool, HKCombineError>()
+        
+        let callback: (HKAuthorizationRequestStatus, Error?) -> () = {
+            result, error in
+            
+            guard error == nil else {
+                subject.send(completion: .failure(HKCombineError.noHKAvailable(error: error)))
+                return
+            }
+            
+            subject.send(result == .shouldRequest)
+            subject.send(completion: .finished)
+        }
+        
+        guard HKHealthStore.isHealthDataAvailable() else {
+            return Fail(error: HKCombineError.noHKAvailable(error: nil)).eraseToAnyPublisher()
+        }
+        
+        getRequestStatusForAuthorization(toShare: toShare ? types : [] , read: toRead ? types : []) { (result, error) in
             callback(result, error)
         }
         
@@ -236,12 +273,12 @@ extension HKHealthStore: HKHealthStoreCombine {
         
         let workoutPredicate = HKQuery.predicateForWorkouts(with: type)
         
-        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
+        let datePredicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
         
-        let compound = NSCompoundPredicate(andPredicateWithSubpredicates: [workoutPredicate, predicate])
+        let compoundPredicate = NSCompoundPredicate(andPredicateWithSubpredicates: [workoutPredicate, datePredicate])
         
         let query = HKSampleQuery(sampleType: .workoutType(),
-                                  predicate: compound,
+                                  predicate: compoundPredicate,
                                   limit: HKObjectQueryNoLimit,
                                   sortDescriptors: [sortDescriptor]) { (query, samples, error) in
             guard error == nil else {
@@ -262,7 +299,7 @@ extension HKHealthStore: HKHealthStoreCombine {
     }
     
     
-    fileprivate func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKWorkoutCombineDetails, Error> {
+    fileprivate func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, Error> {
         return workout.workoutWithDetails
     }
       
@@ -298,40 +335,6 @@ extension HKHealthStore: HKHealthStoreCombine {
         }
         
         self.execute(query)
-        
-        return subject.eraseToAnyPublisher()
-    }
-    
-    
-    /// <#Description#>
-    /// - Parameters:
-    ///   - types: <#types description#>
-    ///   - toShare: <#toShare description#>
-    ///   - toRead: <#toRead description#>
-    /// - Returns: <#description#>
-    public func needsToAuthorize(types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
-        
-        let subject = PassthroughSubject<Bool, HKCombineError>()
-        
-        let callback: (HKAuthorizationRequestStatus, Error?) -> () = {
-            result, error in
-            
-            guard error == nil else {
-                subject.send(completion: .failure(HKCombineError.noHKAvailable(error: error)))
-                return
-            }
-            
-            subject.send(result == .shouldRequest)
-            subject.send(completion: .finished)
-        }
-        
-        guard HKHealthStore.isHealthDataAvailable() else {
-            return Fail(error: HKCombineError.noHKAvailable(error: nil)).eraseToAnyPublisher()
-        }
-        
-        getRequestStatusForAuthorization(toShare: toShare ? types : [] , read: toRead ? types : []) { (result, error) in
-            callback(result, error)
-        }
         
         return subject.eraseToAnyPublisher()
     }
