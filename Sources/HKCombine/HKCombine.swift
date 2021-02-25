@@ -134,13 +134,8 @@ private extension HKWorkoutRoute {
                 return
             }
             
-            guard let locations = locations else {
-                subject.send(completion: .failure(HKCombineError.noRoutePointsFound))
-                return
-            }
-            
             /// If more batches of locations are coming add them to the array
-            workoutLocations.append(contentsOf: locations)
+            workoutLocations.append(contentsOf: locations ?? [])
             
             /// Once no more location batches have to be returned the publisher
             /// will be terminated after sending the finished array of locations
@@ -191,6 +186,7 @@ extension HKHealthStore: HKHealthStoreCombine {
         let sampleQuery = HKSampleQuery(sampleType: sampleType, predicate: predicate, limit: limit, sortDescriptors: nil, resultsHandler: { (query, samples, error) in
             
             let samples = samples as? [HKQuantitySample] ?? []
+            
             subject.send(samples)
             subject.send(completion: .finished)
         })
@@ -211,21 +207,22 @@ extension HKHealthStore: HKHealthStoreCombine {
         let subject = PassthroughSubject<Bool, HKCombineError>()
         
         let callback: (Bool, Error?) -> () = { result, error in
-            if let error = error {
-                subject.send(completion: .failure(.noHKAvailable(error: error)))
-            } else {
-                subject.send(result)
-                subject.send(completion: .finished)
+            
+            guard error == nil else {
+                return subject.send(completion: .failure(.noHKAvailable(error: error)))
             }
+            
+            subject.send(result)
+            subject.send(completion: .finished)
         }
         
-        if !HKHealthStore.isHealthDataAvailable() {
+        guard HKHealthStore.isHealthDataAvailable() else {
             callback(false, nil)
-        } else {
-            HKHealthStore().requestAuthorization(toShare: toShare ? types : nil,
-                                                 read: toRead ? types : nil) { (result, error) in
-                callback(result, error)
-            }
+            return subject.eraseToAnyPublisher()
+        }
+        
+        HKHealthStore().requestAuthorization(toShare: toShare ? types : nil, read: toRead ? types : nil) { (result, error) in
+            callback(result, error)
         }
         
         return subject.eraseToAnyPublisher()
