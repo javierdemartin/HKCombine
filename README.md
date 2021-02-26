@@ -1,24 +1,26 @@
 ![platforms](https://img.shields.io/badge/platforms-iOS-lightgrey)
+![platforms](https://img.shields.io/badge/platforms-watchOS-lightgrey)
 ![code-size](https://img.shields.io/github/languages/code-size/javierdemartin/HKCombine?style=plastic)
 
 
 # HKCombine
 
-Combine-based wrapper to perform related queries.
+Combine-based wrapper to perform HealthKit related queries.
 
 ### Installation
+
+Add the repository link as a dependency on Xcode from File, Swift Packages & Add Package Dependency...
 
 ### Usage
 
 This [package](https://github.com/apple/swift-package-manager/blob/main/Documentation/Usage.md) makes extensive use of the [Combine](https://developer.apple.com/documentation/combine#) framework.
-
 
 <details>
  <summary>Check if the device needs to request HealthKit authorization.</summary>
 
 ```swift
 HKHealthStore()
-    .needsToAuthorize(types: TYPES_TO_QUERY, toShare: false, toRead: true)
+    .needsAuthorization(for: TYPES_TO_QUERY, toShare: false, toRead: true)
     .replaceError(with: false)
     .sink(receiveValue: { needsAuthorization in
         
@@ -34,7 +36,8 @@ HKHealthStore()
  <summary>Request permission to HealthKit for the given types. </summary>
 
 ```swift
-HKHealthStore().authorize(types: TYPES_TO_QUERY, toShare: false, toRead: true)
+HKHealthStore()
+    .requestAuthorization(for: TYPES_TO_QUERY, toShare: false, toRead: true)
     .replaceError(with: false)
     .sink(receiveValue: { finished in
         
@@ -49,12 +52,13 @@ HKHealthStore().authorize(types: TYPES_TO_QUERY, toShare: false, toRead: true)
  <summary>Query HealthKit samples.</summary>
 
 ```swift
-HKHealthStore().authorize(types: TYPES_TO_QUERY, toShare: false, toRead: true)
-    .replaceError(with: false)
-    .sink(receiveValue: { finished in
-        
-        /// Finish the authorization process
-        presentMainScreen = true
+HKHealthStore()
+    .get(sample: SAMPLE_TYPE, start: START_RANGE, end: END_RANGE)
+    .receive(on: DispatchQueue.main)
+    .sink(receiveCompletion: { subscription in
+        /// Do something at the subscriber's end of life or error
+    }, receiveValue: { samples in
+        /// Save samples or do something with them
     }).store(in: &cancellableBag)
 ```
 
@@ -69,7 +73,6 @@ HKHealthStore().authorize(types: TYPES_TO_QUERY, toShare: false, toRead: true)
 
 var samples: [HKCWorkoutDetails] = []
 
-
 HKHealthStore()
     .workouts(type: .running, from: START_RANGE, to: END_RANGE)
     .flatMap({ $0.publisher })
@@ -78,9 +81,7 @@ HKHealthStore()
     .sink(receiveCompletion: { comp in
         switch comp {
         case .finished:
-            
             /// `samples` contains all the data asked for
-            
         case .failure(_):
             /// Act on the error
         }

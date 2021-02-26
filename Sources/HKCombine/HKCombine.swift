@@ -81,7 +81,6 @@ extension HKWorkout {
         return subject.eraseToAnyPublisher()
     }
     
-    
     /// Publisher that emits an array of `HKWorkoutEvent` of type `.segment` which are the ones marked as pace splits on apple watches
     /// https://developer.apple.com/documentation/healthkit/hkworkouteventtype/segment#
     public var appleWatchPaces: AnyPublisher<[HKWorkoutEvent], Never> {
@@ -153,9 +152,9 @@ private extension HKWorkoutRoute {
 
 private protocol HKHealthStoreCombine {
     
-    func needsToAuthorize(types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError>
+    func needsAuthorization(for types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError>
     
-    func authorize(types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError>
+    func requestAuthorization(for types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError>
     
     func workouts(type: HKWorkoutActivityType, _ limit: Int) -> AnyPublisher<[HKWorkout], Error>
     
@@ -202,7 +201,7 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - toShare: `Bool` indicating if the `types` `Set` can create and save these data types to the HealthKit store.
     ///   - toRead:`Bool` indicating if the `types` `Set` can read these data types to the HealthKit store.
     /// - Returns: A publisher that emits a `Bool` when the authorization process finishes
-    public func authorize(types: Set<HKSampleType>, toShare: Bool = true, toRead: Bool = true) -> AnyPublisher<Bool, HKCombineError> {
+    public func requestAuthorization(for types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
         
         let subject = PassthroughSubject<Bool, HKCombineError>()
         
@@ -238,7 +237,7 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - toShare: `Bool` indicating if the `types` `Set` can create and save these data types to the HealthKit store.
     ///   - toRead:`Bool` indicating if the `types` `Set` can read these data types to the HealthKit store.
     /// - Returns: `true` if it needs to request permissions for the given `types`, otherwise `false`.
-    public func needsToAuthorize(types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
+    public func needsAuthorization(for types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
         
         let subject = PassthroughSubject<Bool, HKCombineError>()
         
