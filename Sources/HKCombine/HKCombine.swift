@@ -163,9 +163,42 @@ private protocol HKHealthStoreCombine {
     func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, Error>
     
     func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
+    
+    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date) -> AnyPublisher<HKStatistics, Error>
 }
 
 extension HKHealthStore: HKHealthStoreCombine {
+    
+    
+    /// Perform statistical calculations over a set of samples
+    /// - Parameters:
+    ///   - type: Type of sample to search for. Must be an instance of `HKQuantityType`
+    ///   - options: Options specified for the query
+    ///   - startDate: Start date range for the query
+    ///   - endDate: End date range for the query
+    /// - Returns: Returns a publisher that publishes downstream the query result
+    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date) -> AnyPublisher<HKStatistics, Error> {
+        
+        let subject = PassthroughSubject<HKStatistics, Error>()
+        
+        let predicate = HKStatisticsQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
+        
+        let query = HKStatisticsQuery(quantityType: type, quantitySamplePredicate: predicate, options: options, completionHandler: { (query, statistics, error) in
+            
+            guard error == nil else {
+                subject.send(completion: .failure(error!))
+                return
+            }
+            
+            subject.send(statistics!)
+            subject.send(completion: .finished)
+        })
+        
+        HKHealthStore().execute(query)
+        
+        return subject.eraseToAnyPublisher()
+    }
+    
     
     /// General query that returns a snapshot of all the matching samples in the HealthKit store
     /// - Parameters:
