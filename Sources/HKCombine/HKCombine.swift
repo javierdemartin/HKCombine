@@ -60,18 +60,23 @@ extension HKWorkout {
         return subject
     }
     
+    
+    /// Query the heart rate samples created during the workout start & end `Date` range
     private var heartRateSubject: AnyPublisher<[HKQuantitySample], Error> {
         
         let subject = PassthroughSubject<[HKQuantitySample], Error>()
         
         let type = HKQuantityType.quantityType(forIdentifier: HKQuantityTypeIdentifier.heartRate)!
         
-        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate)
+        let predicate = HKQuery.predicateForObjects(from: self)
+//        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [.strictEndDate, .strictEndDate])
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)
         
         let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sortDescriptor]) { (query, samples, error) in
+            
             let quantitySamples = samples as? [HKQuantitySample] ?? []
+            
             subject.send(quantitySamples)
             subject.send(completion: .finished)
         }
@@ -169,7 +174,6 @@ private protocol HKHealthStoreCombine {
 
 extension HKHealthStore: HKHealthStoreCombine {
     
-    
     /// Perform statistical calculations over a set of samples
     /// - Parameters:
     ///   - type: Type of sample to search for. Must be an instance of `HKQuantityType`
@@ -194,7 +198,7 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
-        HKHealthStore().execute(query)
+        self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
@@ -215,7 +219,7 @@ extension HKHealthStore: HKHealthStoreCombine {
 
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end)
         
-        let sampleQuery = HKSampleQuery(sampleType: sampleType, predicate: predicate, limit: limit, sortDescriptors: nil, resultsHandler: { (query, samples, error) in
+        let query = HKSampleQuery(sampleType: sampleType, predicate: predicate, limit: limit, sortDescriptors: nil, resultsHandler: { (query, samples, error) in
             
             let samples = samples as? [HKQuantitySample] ?? []
             
@@ -223,7 +227,7 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
-        HKHealthStore().execute(sampleQuery)
+        self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
@@ -233,7 +237,6 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - toShare: Set containing the data types to share.
     ///   - toRead: Set containing the data types to read.
     /// - Returns: A publisher that emits a `Bool` when the authorization process finishes
-//    public func requestAuthorization(for types: Set<HKSampleType>, toShare: Bool, toRead: Bool) -> AnyPublisher<Bool, HKCombineError> {
     public func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> AnyPublisher<Bool, HKCombineError> {
         
         let subject = PassthroughSubject<Bool, HKCombineError>()
@@ -256,7 +259,7 @@ extension HKHealthStore: HKHealthStoreCombine {
             return subject.eraseToAnyPublisher()
         }
         
-        HKHealthStore().requestAuthorization(toShare: toShare, read: toRead) { (result, error) in
+        self.requestAuthorization(toShare: toShare, read: toRead) { (result, error) in
             /// Won't be called until the system's HealthKit permission has ended
             callback(result, error)
         }
