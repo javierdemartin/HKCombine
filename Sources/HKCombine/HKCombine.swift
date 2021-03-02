@@ -101,10 +101,126 @@ extension HKWorkout {
     
     /// TODO: Do calculation of non apple watch paces
     /// https://stackoverflow.com/questions/33826972/healthkit-running-splits-in-kilometres-code-inaccurate-why
+    
+    public var splits: AnyPublisher<[HKWorkoutEvent], Never> {
+        
+        let subject = PassthroughSubject<[HKWorkoutEvent], Never>()
+        
+        var paces: [HKWorkoutEvent] = []
+        
+        guard let distanceType = HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier.distanceWalkingRunning) else {
+            return [].publisher.eraseToAnyPublisher()
+        }
+        
+        let workoutPredicate = HKQuery.predicateForObjects(from: self)
+        
+        let startDateSort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+        
+        var pauses: TimeInterval = 0
+        
+        /// Query HealthKit's store
+        let query = HKSampleQuery(sampleType: distanceType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [startDateSort]) {
+            
+            (sampleQuery, results, error) -> Void in
+            
+            guard let distanceSamples = results as? [HKQuantitySample], !distanceSamples.isEmpty else {
+                subject.send(paces)
+                subject.send(completion: .finished)
+                return
+            }
+            
+            /// GPS might take some time to "warm up" and receive a usable connection since the user presses start.
+            /// This is calculated by obtaining the difference of the workout's startDate and the startDate of the first location sample
+            let initialDrift = self.startDate.timeIntervalSince(distanceSamples[0].startDate)
+            
+            pauses -= initialDrift
+            
+            /// Values will be added progressively until they fill a whole kilometer
+            /// For example, as it reaches 1.004,5 meters there are 4,5 meters that have to be left for the next round.
+            var meters = 0.00
+            
+            /// Left-over duration used when a complete kilometer is reached
+            var addedDuration = 0.0
+            
+            // Time where the current interval has started
+            var splitIntervalStart = distanceSamples[0].startDate
+            
+            /// Iterate through the [HKQuantitySample] array. It will be samples with distances in small meter samples.
+            /// Trick is to stack them up progresively until they stack a full kilometre
+            for (index, element) in distanceSamples.enumerated() {
+                
+                if index > 1 {
+                    
+                    if distanceSamples[index].startDate != distanceSamples[index - 1].endDate {
+                        pauses += distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate)
+                        //                            print(pauses)
+                        //                            print("[GPS] Drop \(distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate))")
+                    }
+                }
+                
+                addedDuration += element.startDate.distance(to: element.endDate)
+                meters +=  element.quantity.doubleValue(for: HKUnit.meter())
+                
+                /// Finished processing a full kilometre
+                if meters >= 1000 {
+                    
+                    //                        print("Duration for interval \(addedDuration)")
+                    //                            var duration: Double = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - pauses
+                    addedDuration = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - pauses
+                    //                            addedDuration -= pauses
+                    let pace = Double(addedDuration / meters)
+                    
+                    /// Calculate the excess of meters that are over an exact kilometer
+                    let remainder = meters.truncatingRemainder(dividingBy: 1000)
+                    
+                    let remainerDuration: TimeInterval = remainder * pace
+                    
+                    splitIntervalStart = distanceSamples[index].endDate.addingTimeInterval(-1 * remainerDuration)
+                    
+                    
+                    let metadata: [String: Any] = [
+                        
+                        "_HKPrivateMetadataSplitActiveDurationQuantity": HKQuantity(unit: HKUnit.second(), doubleValue: addedDuration),
+                        "_HKPrivateMetadataSplitDistanceQuantity" : HKQuantity(unit: HKUnit.meter(), doubleValue: meters - remainder),
+                        "_HKPrivateMetadataSplitMeasuringSystem": 1
+                    ]
+                    
+//                    paces.append(Pace(meters: meters - remainder, duration: addedDuration))
+                    paces.append(HKWorkoutEvent(type: .segment, dateInterval: DateInterval(start: splitIntervalStart, duration: addedDuration), metadata: metadata))
+                    
+                    meters = remainder
+                    addedDuration = remainerDuration
+                    
+                    pauses = 0
+                }
+                
+                /// Penultimate sample
+                if (distanceSamples.count - 1 ) == index {
+                    
+                    let intervalDuration = distanceSamples[index].endDate.timeIntervalSince(splitIntervalStart)
+                    
+                    // TODO: Review this calculations
+                    
+//                    paces.append(HKWorkoutEvent(type: .segment, dateInterval: DateInterval(start: splitIntervalStart, duration: addedDuration), metadata: ["_HKPrivateMetadataSplitActiveDurationQuantity": "\(intervalDuration) m"]))
+                    
+//                    paces.append(Pace(meters: meters, duration: intervalDuration))
+                }
+            }
+            
+            subject.send(paces)
+            subject.send(completion: .finished)
+            
+            
+        }
+        
+        HKHealthStore().execute(query)
+        
+        return subject.eraseToAnyPublisher()
+    }
 }
 
 /// Relevant data from a HKWorkout including samples
-public struct HKCWorkoutDetails: Hashable {
+public struct HKCWorkoutDetails: Hashable, Identifiable {
     
     public let id = UUID()
     /// The actual workout
@@ -169,7 +285,7 @@ private protocol HKHealthStoreCombine {
     
     func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
     
-    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date) -> AnyPublisher<HKStatistics, Error>
+    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, Error>
 }
 
 extension HKHealthStore: HKHealthStoreCombine {
@@ -180,8 +296,9 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - options: Options specified for the query
     ///   - startDate: Start date range for the query
     ///   - endDate: End date range for the query
+    ///   - limit: Number of samples to be returned, defaults to `HKObjectQueryNoLimit`
     /// - Returns: Returns a publisher that publishes downstream the query result
-    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date) -> AnyPublisher<HKStatistics, Error> {
+    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<HKStatistics, Error> {
         
         let subject = PassthroughSubject<HKStatistics, Error>()
         
@@ -198,11 +315,11 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
+//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
-    
     
     /// General query that returns a snapshot of all the matching samples in the HealthKit store
     /// - Parameters:
@@ -227,6 +344,7 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
+//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
@@ -323,10 +441,14 @@ extension HKHealthStore: HKHealthStoreCombine {
                 return
             }
             
+            print(startDate)
+            print(endDate)
+            
             subject.send(workouts)
             subject.send(completion: .finished)
         }
         
+//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
@@ -368,7 +490,8 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         }
         
-        self.execute(query)
+//        self.execute(query)
+        HKHealthStore().execute(query)
         
         return subject.eraseToAnyPublisher()
     }
