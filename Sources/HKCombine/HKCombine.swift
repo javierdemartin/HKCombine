@@ -2,21 +2,50 @@ import HealthKit
 import Combine
 import CoreLocation
 
+private protocol HKHealthStoreCombine {
+    
+    func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> AnyPublisher<Bool, HKCombineError>
+    
+    func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> AnyPublisher<Bool, HKCombineError>
+    
+    func workouts(type: HKWorkoutActivityType, _ limit: Int) -> AnyPublisher<[HKWorkout], HKCombineError>
+    
+    func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int) -> AnyPublisher<[HKWorkout], HKCombineError>
+    
+    func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, HKCombineError>
+    
+    func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
+    
+    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, HKCombineError>
+}
+
 public enum HKCombineError: Error {
-    case noWorkoutEvents
-    case errorHKQuantityTypeIdentifier
-    case noSamples
-    case noHKAvailable(error: Error?)
-    case noRoutePointsFound
+    /// Current device does not have HealthKit capabilities
+    case noHKAvailable
+    /// No workouts have been found for the given activity type and/or date range
     case noWorkoutsFound
-    case noPermission
+    /// Given a HKWorkout there are no `HKWorkoutEvents` present
+    case missingHKWorkoutEvents
+    /// Wrapper around an upstream error from HealthKit
+    case upstream(error: Error)
+}
+
+extension HKCombineError: Equatable {
+    public static func == (lhs: HKCombineError, rhs: HKCombineError) -> Bool {
+        switch (lhs, rhs) {
+        case (.noWorkoutsFound, .noWorkoutsFound):
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 extension HKWorkout {
     
-    public var workoutWithDetails: AnyPublisher<HKCWorkoutDetails, Error> {
+    public var workoutWithDetails: AnyPublisher<HKCWorkoutDetails, HKCombineError> {
         
-        let locationsSamplesPublisher = routeSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], Error> in
+        let locationsSamplesPublisher = routeSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], HKCombineError> in
             workoutRoute.locationsSubject
         })
 //        .replaceEmpty(with: [])
@@ -37,16 +66,16 @@ extension HKWorkout {
     }
     
     /// Query a workout together with workout route samples
-    private var routeSubject:  PassthroughSubject<HKWorkoutRoute, Error> {
+    private var routeSubject:  PassthroughSubject<HKWorkoutRoute, HKCombineError> {
         
-        let subject = PassthroughSubject<HKWorkoutRoute, Error>()
+        let subject = PassthroughSubject<HKWorkoutRoute, HKCombineError>()
         
         let predicate = HKQuery.predicateForObjects(from: self)
         
         let query = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, routes, error) in
             
             guard let routes = routes as? [HKWorkoutRoute], error == nil else {
-                subject.send(completion: .failure(error!))
+                subject.send(completion: .failure(.upstream(error: error!)))
                 return
             }
             
@@ -60,16 +89,14 @@ extension HKWorkout {
         return subject
     }
     
-    
     /// Query the heart rate samples created during the workout start & end `Date` range
-    private var heartRateSubject: AnyPublisher<[HKQuantitySample], Error> {
+    private var heartRateSubject: AnyPublisher<[HKQuantitySample], HKCombineError> {
         
-        let subject = PassthroughSubject<[HKQuantitySample], Error>()
+        let subject = PassthroughSubject<[HKQuantitySample], HKCombineError>()
         
         let type = HKQuantityType.quantityType(forIdentifier: HKQuantityTypeIdentifier.heartRate)!
         
         let predicate = HKQuery.predicateForObjects(from: self)
-//        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [.strictEndDate, .strictEndDate])
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)
         
@@ -88,36 +115,36 @@ extension HKWorkout {
     
     /// Publisher that emits an array of `HKWorkoutEvent` of type `.segment` which are the ones marked as pace splits on apple watches
     /// https://developer.apple.com/documentation/healthkit/hkworkouteventtype/segment#
-    public var appleWatchPaces: AnyPublisher<[HKWorkoutEvent], Never> {
+    public var appleWatchPaces: AnyPublisher<[HKWorkoutEvent], HKCombineError> {
         
         guard let events = self.workoutEvents else {
-            return [].publisher.eraseToAnyPublisher()
+            return Fail(error: HKCombineError.missingHKWorkoutEvents).eraseToAnyPublisher()
         }
         
         let filtered = events.filter({ $0.type == .segment })
         
-        return Publishers.MergeMany(filtered.publisher).collect().eraseToAnyPublisher()
+        return Publishers.MergeMany(filtered.publisher).collect().setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
     }
     
     /// TODO: Do calculation of non apple watch paces
     /// https://stackoverflow.com/questions/33826972/healthkit-running-splits-in-kilometres-code-inaccurate-why
-    
-    public var splits: AnyPublisher<[HKWorkoutEvent], Never> {
+    /// Splits by kilometer/mile for workouts not recorded with Apple Watch's Workout application
+    public var splits: AnyPublisher<[HKWorkoutEvent], HKCombineError> {
         
         let subject = PassthroughSubject<[HKWorkoutEvent], Never>()
         
         var paces: [HKWorkoutEvent] = []
         
         guard let distanceType = HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier.distanceWalkingRunning) else {
-            return [].publisher.eraseToAnyPublisher()
+            return [].publisher.setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
         }
-        
+
         let workoutPredicate = HKQuery.predicateForObjects(from: self)
         
         let startDateSort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         
-        var pauses: TimeInterval = 0
-        
+        var gpsDrops: TimeInterval = 0
+
         /// Query HealthKit's store
         let query = HKSampleQuery(sampleType: distanceType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [startDateSort]) {
             
@@ -131,9 +158,9 @@ extension HKWorkout {
             
             /// GPS might take some time to "warm up" and receive a usable connection since the user presses start.
             /// This is calculated by obtaining the difference of the workout's startDate and the startDate of the first location sample
-            let initialDrift = self.startDate.timeIntervalSince(distanceSamples[0].startDate)
+            let initialDrift = distanceSamples[0].startDate.timeIntervalSince(self.startDate)
             
-            pauses -= initialDrift
+            gpsDrops += initialDrift
             
             /// Values will be added progressively until they fill a whole kilometer
             /// For example, as it reaches 1.004,5 meters there are 4,5 meters that have to be left for the next round.
@@ -143,7 +170,7 @@ extension HKWorkout {
             var addedDuration = 0.0
             
             // Time where the current interval has started
-            var splitIntervalStart = distanceSamples[0].startDate
+            var splitIntervalStart = distanceSamples[0].startDate + initialDrift
             
             /// Iterate through the [HKQuantitySample] array. It will be samples with distances in small meter samples.
             /// Trick is to stack them up progresively until they stack a full kilometre
@@ -152,9 +179,8 @@ extension HKWorkout {
                 if index > 1 {
                     
                     if distanceSamples[index].startDate != distanceSamples[index - 1].endDate {
-                        pauses += distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate)
-                        //                            print(pauses)
-                        //                            print("[GPS] Drop \(distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate))")
+                        
+                        gpsDrops += distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate)
                     }
                 }
                 
@@ -163,17 +189,19 @@ extension HKWorkout {
                 
                 /// Finished processing a full kilometre
                 if meters >= 1000 {
+
+                    addedDuration = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - gpsDrops
                     
-                    //                        print("Duration for interval \(addedDuration)")
-                    //                            var duration: Double = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - pauses
-                    addedDuration = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - pauses
-                    //                            addedDuration -= pauses
+                    /// seconds / meters
                     let pace = Double(addedDuration / meters)
                     
                     /// Calculate the excess of meters that are over an exact kilometer
                     let remainder = meters.truncatingRemainder(dividingBy: 1000)
                     
                     let remainerDuration: TimeInterval = remainder * pace
+                    
+                    /// Removed the extra meters from 100x.x meters
+                    addedDuration -= remainerDuration
                     
                     splitIntervalStart = distanceSamples[index].endDate.addingTimeInterval(-1 * remainerDuration)
                     
@@ -191,31 +219,30 @@ extension HKWorkout {
                     meters = remainder
                     addedDuration = remainerDuration
                     
-                    pauses = 0
+                    gpsDrops = 0
                 }
                 
                 /// Penultimate sample
                 if (distanceSamples.count - 1 ) == index {
                     
-                    let intervalDuration = distanceSamples[index].endDate.timeIntervalSince(splitIntervalStart)
+                    let metadata: [String: Any] = [
+                        
+                        "_HKPrivateMetadataSplitActiveDurationQuantity": HKQuantity(unit: HKUnit.second(), doubleValue: addedDuration),
+                        "_HKPrivateMetadataSplitDistanceQuantity" : HKQuantity(unit: HKUnit.meter(), doubleValue: meters),
+                        "_HKPrivateMetadataSplitMeasuringSystem": 1
+                    ]
                     
-                    // TODO: Review this calculations
-                    
-//                    paces.append(HKWorkoutEvent(type: .segment, dateInterval: DateInterval(start: splitIntervalStart, duration: addedDuration), metadata: ["_HKPrivateMetadataSplitActiveDurationQuantity": "\(intervalDuration) m"]))
-                    
-//                    paces.append(Pace(meters: meters, duration: intervalDuration))
+                    paces.append(HKWorkoutEvent(type: .segment, dateInterval: DateInterval(start: splitIntervalStart, duration: addedDuration), metadata: metadata))
                 }
             }
             
             subject.send(paces)
             subject.send(completion: .finished)
-            
-            
         }
-        
+    
         HKHealthStore().execute(query)
         
-        return subject.eraseToAnyPublisher()
+        return subject.setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
     }
 }
 
@@ -241,16 +268,16 @@ private extension HKWorkoutRoute {
     
     /// Query the `HKWorkoutRoute` associated with an exercise
     /// Emits an array of `[CLLocation]` if it succeeds
-    var locationsSubject: PassthroughSubject<[CLLocation], Error> {
+    var locationsSubject: PassthroughSubject<[CLLocation], HKCombineError> {
         
-        let subject = PassthroughSubject<[CLLocation], Error>()
+        let subject = PassthroughSubject<[CLLocation], HKCombineError>()
 
         var workoutLocations: [CLLocation] = []
         
         let query = HKWorkoutRouteQuery(route: self) { (query, locations, done, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(error!))
+                subject.send(completion: .failure(.upstream(error: error!)))
                 return
             }
             
@@ -271,23 +298,6 @@ private extension HKWorkoutRoute {
     }
 }
 
-private protocol HKHealthStoreCombine {
-    
-    func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> AnyPublisher<Bool, HKCombineError>
-    
-    func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> AnyPublisher<Bool, HKCombineError>
-    
-    func workouts(type: HKWorkoutActivityType, _ limit: Int) -> AnyPublisher<[HKWorkout], Error>
-    
-    func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date) -> AnyPublisher<[HKWorkout], Error>
-    
-    func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, Error>
-    
-    func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
-    
-    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, Error>
-}
-
 extension HKHealthStore: HKHealthStoreCombine {
     
     /// Perform statistical calculations over a set of samples
@@ -298,16 +308,16 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - endDate: End date range for the query
     ///   - limit: Number of samples to be returned, defaults to `HKObjectQueryNoLimit`
     /// - Returns: Returns a publisher that publishes downstream the query result
-    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<HKStatistics, Error> {
+    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<HKStatistics, HKCombineError> {
         
-        let subject = PassthroughSubject<HKStatistics, Error>()
+        let subject = PassthroughSubject<HKStatistics, HKCombineError>()
         
         let predicate = HKStatisticsQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
         
         let query = HKStatisticsQuery(quantityType: type, quantitySamplePredicate: predicate, options: options, completionHandler: { (query, statistics, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(error!))
+                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
                 return
             }
             
@@ -315,7 +325,6 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
-//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
@@ -344,7 +353,6 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         })
         
-//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
@@ -365,7 +373,7 @@ extension HKHealthStore: HKHealthStoreCombine {
         let callback: (Bool, Error?) -> () = { result, error in
             
             guard error == nil else {
-                return subject.send(completion: .failure(.noHKAvailable(error: error)))
+                return subject.send(completion: .failure(.upstream(error: error!)))
             }
             
             subject.send(result)
@@ -394,11 +402,10 @@ extension HKHealthStore: HKHealthStoreCombine {
         
         let subject = PassthroughSubject<Bool, HKCombineError>()
         
-        let callback: (HKAuthorizationRequestStatus, Error?) -> () = {
-            result, error in
+        let callback: (HKAuthorizationRequestStatus, Error?) -> () = { result, error in
             
             guard error == nil else {
-                subject.send(completion: .failure(HKCombineError.noHKAvailable(error: error)))
+                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
                 return
             }
             
@@ -407,7 +414,7 @@ extension HKHealthStore: HKHealthStoreCombine {
         }
         
         guard HKHealthStore.isHealthDataAvailable() else {
-            return Fail(error: HKCombineError.noHKAvailable(error: nil)).eraseToAnyPublisher()
+            return Fail(error: HKCombineError.noHKAvailable).eraseToAnyPublisher()
         }
         
         getRequestStatusForAuthorization(toShare: toShare , read: toRead) { (result, error) in
@@ -417,45 +424,54 @@ extension HKHealthStore: HKHealthStoreCombine {
         return subject.eraseToAnyPublisher()
     }
     
-    public func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date) -> AnyPublisher<[HKWorkout], Error> {
+    
+    /// Query workouts from a type in a date range
+    /// - Parameters:
+    ///   - type: Workout activity type to query
+    ///   - startDate: Start date range to perform the query
+    ///   - endDate: End date range to perform the query
+    ///   - limit: Limits the number of values to be returned, defaults to `HKObjectQueryNoLimit`
+    /// - Returns: Publisher that emits an array of `HKWorkout`.
+    public func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], HKCombineError> {
         
-        let subject = PassthroughSubject<[HKWorkout], Error>()
+        let subject = PassthroughSubject<[HKWorkout], HKCombineError>()
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         
         let workoutPredicate = HKQuery.predicateForWorkouts(with: type)
         
-        let datePredicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
+        let datePredicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [.strictEndDate, .strictStartDate])
         
         let compoundPredicate = NSCompoundPredicate(andPredicateWithSubpredicates: [workoutPredicate, datePredicate])
         
         let query = HKSampleQuery(sampleType: .workoutType(),
                                   predicate: compoundPredicate,
-                                  limit: HKObjectQueryNoLimit,
+                                  limit: limit,
                                   sortDescriptors: [sortDescriptor]) { (query, samples, error) in
+            
             guard error == nil else {
-                return subject.send(completion: .failure(error!))
+                return subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
             }
+            
             guard let workouts = samples as? [HKWorkout] else {
                 subject.send(completion: .failure(HKCombineError.noWorkoutsFound))
                 return
             }
             
-            print(startDate)
-            print(endDate)
-            
             subject.send(workouts)
             subject.send(completion: .finished)
         }
         
-//        self.execute(query)
         self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
     
     
-    fileprivate func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, Error> {
+    /// Given a `HKWorkout` retrieve heart rate and `HKWorkoutRoute` values in a `HKCWorkoutDetails` containing both of them.
+    /// - Parameter workout: `HKWorkout` to get the information from
+    /// - Returns: Publisher that emits a single `HKCWorkouDetails` object with the associated data
+    fileprivate func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, HKCombineError> {
         return workout.workoutWithDetails
     }
       
@@ -464,8 +480,8 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - type: `HKWorkoutActivityType` to query workouts for
     ///   - limit: `Int` to limit the number of workouts to be returned, defaults to `HKObjectQueryNoLimit
     /// - Returns: Publisher that emits an array of `HWorkout`
-    public func workouts(type: HKWorkoutActivityType, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], Error> {
-        let subject = PassthroughSubject<[HKWorkout], Error>()
+    public func workouts(type: HKWorkoutActivityType, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], HKCombineError> {
+        let subject = PassthroughSubject<[HKWorkout], HKCombineError>()
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate,
                                               ascending: false)
@@ -478,7 +494,7 @@ extension HKHealthStore: HKHealthStoreCombine {
                                   sortDescriptors: [sortDescriptor]) { (query, samples, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(error!))
+                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
                 return
             }
             guard let workouts = samples as? [HKWorkout] else {
@@ -490,8 +506,7 @@ extension HKHealthStore: HKHealthStoreCombine {
             subject.send(completion: .finished)
         }
         
-//        self.execute(query)
-        HKHealthStore().execute(query)
+        self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
