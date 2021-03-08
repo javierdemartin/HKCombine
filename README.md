@@ -7,6 +7,8 @@
 
 Combine-based wrapper to perform HealthKit related queries.
 
+My app, [Singlet](https://apps.apple.com/app/id1545746941), makes full use of this Swift Package. 
+
 ### Installation
 
 Add the repository link as a dependency on Xcode from File, Swift Packages & Add Package Dependency...
@@ -68,6 +70,8 @@ HKHealthStore()
  <summary>Query HKWorkout with all the associated heart rate and location data.</summary>
  
  You can also query for a number of samples instead of using a `Date` range.
+ 
+ Bear in mind that this is an expensive request as it requests both heart rate data and the workout's route from every requested HKWorkout.
 
 ```swift
 
@@ -89,6 +93,88 @@ HKHealthStore()
         samples.append(details)
     })
     .store(in: &cancellableBag)
+```
+
+</details>
+
+<details>
+ <summary>`HKStatisticQuery`</summary>
+ 
+ The gist of this is to replace the possible error that might surface if the queried sample doesn't have permissions for it with a `nil`, or whatever suits your purpose, before continuing.
+
+```swift
+
+HKHealthStore()
+    .statistic(for: HKObjectType.quantityType(forIdentifier: .restingHeartRate)!, with: .discreteAverage, from: Date().startOfMonth!, to: Date())
+    .map({ $0.averageQuantity()?.doubleValue(for: UserUnits.shared().heartCountUnits) })
+    .replaceError(with: nil)
+    .assertNoFailure()
+    .receive(on: DispatchQueue.main)
+    .assign(to: &$VARIABLE)
+```
+
+</details>
+
+<details>
+ <summary>Splits/Paces from a `HKWorkout`</summary>
+ 
+ If the `HKWorkout` you're querying has been recorded from an Apple Watch using the native Workouts.app this is straightforward.
+
+```swift
+
+workout.appleWatchPaces
+    .receive(on: DispatchQueue.main)
+    .replaceError(with: []) 
+    .sink(receiveCompletion: { sub in
+        
+        switch sub {
+        
+        case .finished:
+            break
+        case .failure(_):
+            fatalError()
+        }
+    },receiveValue: { events in
+        
+        /// Work with the received `HKWorkoutEvents`
+        
+    }).store(in: &bag)
+```
+
+There are other times when you want to query paces from an Apple Watch if it exists and default to manual calculations if it fails or they don't exist. This requires access to query `.distanceWalkingRunning` samples.
+
+**NOTE**: These manual calculations, `splits` might have some errors as this is an algorithm where some issues might appear.
+
+**NOTE 2**: Apps like Strava might not produce reliable calculations by the way the save data on `HealthKit`. As far as I know there is no workaround around this. If you have a better solution for this feel free to open a [pull request](https://github.com/javierdemartin/HKCombine/pulls).
+
+```swift
+
+workout.appleWatchPaces
+    .receive(on: DispatchQueue.main)
+    .replaceError(with: [])
+    .flatMap({ applePaces -> AnyPublisher<[HKWorkoutEvent], HKCombineError> in
+        
+        if applePaces.isEmpty {
+            return workout.workout.splits
+        } else {
+            return Just(applePaces).setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
+        }
+    })
+    
+    .sink(receiveCompletion: { sub in
+        
+        switch sub {
+        
+        case .finished:
+            break
+        case .failure(_):
+            fatalError()
+        }
+    },receiveValue: { events in
+        
+        /// Work with the `HKWorkoutEvents`
+        
+    }).store(in: &bag)
 ```
 
 </details>
