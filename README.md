@@ -31,7 +31,6 @@ HKHealthStore()
         
     }).store(in: &cancellableBag)
 ```
-
 </details>
 
 <details>
@@ -98,7 +97,7 @@ HKHealthStore()
 </details>
 
 <details>
- <summary>`HKStatisticQuery`</summary>
+ <summary>HKStatisticQuery</summary>
  
  The gist of this is to replace the possible error that might surface if the queried sample doesn't have permissions for it with a `nil`, or whatever suits your purpose, before continuing.
 
@@ -116,7 +115,7 @@ HKHealthStore()
 </details>
 
 <details>
- <summary>Splits/Paces from a `HKWorkout`</summary>
+ <summary>Splits/Paces from a HKWorkout</summary>
  
  If the `HKWorkout` you're querying has been recorded from an Apple Watch using the native Workouts.app this is straightforward.
 
@@ -152,12 +151,12 @@ There are other times when you want to query paces from an Apple Watch if it exi
 workout.appleWatchPaces
     .receive(on: DispatchQueue.main)
     .replaceError(with: [])
-    .flatMap({ applePaces -> AnyPublisher<[HKWorkoutEvent], HKCombineError> in
+    .flatMap({ applePaces -> AnyPublisher<[HKWorkoutEvent], Error> in
         
         if applePaces.isEmpty {
             return workout.workout.splits
         } else {
-            return Just(applePaces).setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
+            return Just(applePaces).setFailureType(to: Error.self).eraseToAnyPublisher()
         }
     })
     
@@ -178,3 +177,8 @@ workout.appleWatchPaces
 ```
 
 </details>
+
+
+### Disclaimers
+
+Strava

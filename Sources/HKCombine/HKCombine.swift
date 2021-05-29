@@ -1,54 +1,61 @@
+/**
+ HKCombine
+ 
+ Combine-based wrapper to perform HealthKit related queries.
+ 
+ Created by Javier de Martín Gil.
+ */
+
 import HealthKit
 import Combine
 import CoreLocation
+import os
+
+/// `HKCombine` will log special events and faults to the device's Console
+let logger = Logger(subsystem: "in.javierdemart.hkcombine", category: "HKCombine")
 
 private protocol HKHealthStoreCombine {
     
-    func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> AnyPublisher<Bool, HKCombineError>
+    func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> Deferred<Future<Bool, Error>>
+        
+    func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> Deferred<Future<Bool, Error>>
     
-    func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> AnyPublisher<Bool, HKCombineError>
+    func workouts(type: HKWorkoutActivityType, _ limit: Int) -> AnyPublisher<[HKWorkout], Error>
     
-    func workouts(type: HKWorkoutActivityType, _ limit: Int) -> AnyPublisher<[HKWorkout], HKCombineError>
+    func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int) -> AnyPublisher<[HKWorkout], Error>
     
-    func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int) -> AnyPublisher<[HKWorkout], HKCombineError>
+    func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], Error> where T: HKObjectType
     
-    func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, HKCombineError>
+    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, Error>
     
-    func get<T>(sample: T, start: Date, end: Date, limit: Int) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType
-    
-    func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, HKCombineError>
+    func workouts(id: UUID, limit: Int) -> AnyPublisher<[HKWorkout], Error> 
 }
 
-public enum HKCombineError: Error {
-    /// Current device does not have HealthKit capabilities
-    case noHKAvailable
-    /// No workouts have been found for the given activity type and/or date range
-    case noWorkoutsFound
-    /// Given a HKWorkout there are no `HKWorkoutEvents` present
-    case missingHKWorkoutEvents
-    /// Wrapper around an upstream error from HealthKit
-    case upstream(error: Error)
-}
-
-extension HKCombineError: Equatable {
-    public static func == (lhs: HKCombineError, rhs: HKCombineError) -> Bool {
-        switch (lhs, rhs) {
-        case (.noWorkoutsFound, .noWorkoutsFound):
-            return true
-        default:
-            return false
-        }
+/// Relevant data from a HKWorkout including samples
+public struct HKCWorkoutDetails {
+    
+    /// The actual workout
+    public let workout: HKWorkout
+    /// A sorted array of location samples, across all HKWorkoutRoutes that are part of the workout
+    public let locations: [CLLocation]
+    /// A sorted array of heartrate samples taken during the workout
+    public let heartRate: [HKQuantitySample]
+    
+    public init(workout: HKWorkout, locations: [CLLocation], heartRate: [HKQuantitySample]) {
+        self.workout = workout
+        self.locations = locations
+        self.heartRate = heartRate
     }
 }
 
 extension HKWorkout {
     
-    public var workoutWithDetails: AnyPublisher<HKCWorkoutDetails, HKCombineError> {
+    public var workoutWithDetails: AnyPublisher<HKCWorkoutDetails, Error> {
         
-        let locationsSamplesPublisher = routeSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], HKCombineError> in
+        let locationsSamplesPublisher = routeSubject.flatMap({ workoutRoute -> PassthroughSubject<[CLLocation], Error> in
             workoutRoute.locationsSubject
         })
-//        .replaceEmpty(with: [])
+        //        .replaceEmpty(with: [])
         /// Given a start value of an empty array
         .scan([]) { $0 + $1 }
         /// After combining all the values in a final array get the latest item which will have all the locations combined
@@ -57,6 +64,7 @@ extension HKWorkout {
         .map({ locationSamples -> [CLLocation] in
             locationSamples.sorted(by: { $0.timestamp <= $1.timestamp })
         })
+        
         /// Subscribe to two publishers, location and heart rate, and producing a tuple upon receiving output from any of the publishers.
         return Publishers.CombineLatest(locationsSamplesPublisher, heartRateSubject)
             .map({ (locationSamples, heartRateSamples) -> HKCWorkoutDetails in
@@ -66,19 +74,23 @@ extension HKWorkout {
     }
     
     /// Query a workout together with workout route samples
-    private var routeSubject:  PassthroughSubject<HKWorkoutRoute, HKCombineError> {
+    public var routeSubject: PassthroughSubject<HKWorkoutRoute, Error> {
         
-        let subject = PassthroughSubject<HKWorkoutRoute, HKCombineError>()
+        let subject = PassthroughSubject<HKWorkoutRoute, Error>()
         
         let predicate = HKQuery.predicateForObjects(from: self)
         
         let query = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, routes, error) in
             
-            guard let routes = routes as? [HKWorkoutRoute], error == nil else {
-                subject.send(completion: .failure(.upstream(error: error!)))
+            guard error == nil else {
+                logger.error("Error fetching workout locations \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
                 return
             }
             
+            let routes: [HKWorkoutRoute] = routes as? [HKWorkoutRoute] ?? []
+            
+            logger.log("Fetched \(routes.count) samples of HKWorkoutRoute")
             routes.forEach({ subject.send($0) })
             
             subject.send(completion: .finished)
@@ -90,9 +102,9 @@ extension HKWorkout {
     }
     
     /// Query the heart rate samples created during the workout start & end `Date` range
-    private var heartRateSubject: AnyPublisher<[HKQuantitySample], HKCombineError> {
+    public var heartRateSubject: AnyPublisher<[HKQuantitySample], Error> {
         
-        let subject = PassthroughSubject<[HKQuantitySample], HKCombineError>()
+        let subject = PassthroughSubject<[HKQuantitySample], Error>()
         
         let type = HKQuantityType.quantityType(forIdentifier: HKQuantityTypeIdentifier.heartRate)!
         
@@ -104,6 +116,7 @@ extension HKWorkout {
             
             let quantitySamples = samples as? [HKQuantitySample] ?? []
             
+            logger.log("Fetched \(quantitySamples.count) heart rate samples")
             subject.send(quantitySamples)
             subject.send(completion: .finished)
         }
@@ -115,42 +128,44 @@ extension HKWorkout {
     
     /// Publisher that emits an array of `HKWorkoutEvent` of type `.segment` which are the ones marked as pace splits on apple watches
     /// https://developer.apple.com/documentation/healthkit/hkworkouteventtype/segment#
-    public var appleWatchPaces: AnyPublisher<[HKWorkoutEvent], HKCombineError> {
+    public var appleWatchPaces: AnyPublisher<[HKWorkoutEvent], Error> {
         
-        guard let events = self.workoutEvents else {
-            return Fail(error: HKCombineError.missingHKWorkoutEvents).eraseToAnyPublisher()
-        }
+        let filtered: [HKWorkoutEvent] = self.workoutEvents?.compactMap({ $0 }).filter({ $0.type == .segment }) ?? []
         
-        let filtered = events.filter({ $0.type == .segment })
+        logger.log("Found \(filtered.count) pace segment events found on workout \(self.uuid) started on \(self.startDate)")
         
-        return Publishers.MergeMany(filtered.publisher).collect().setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
+        return Publishers
+            .MergeMany(filtered.publisher)
+            .collect()
+            .setFailureType(to: Error.self)
+            .eraseToAnyPublisher()
     }
     
     /// TODO: Do calculation of non apple watch paces
     /// https://stackoverflow.com/questions/33826972/healthkit-running-splits-in-kilometres-code-inaccurate-why
     /// Splits by kilometer/mile for workouts not recorded with Apple Watch's Workout application
-    public var splits: AnyPublisher<[HKWorkoutEvent], HKCombineError> {
+    public var splits: AnyPublisher<[HKWorkoutEvent], Error> {
         
         let subject = PassthroughSubject<[HKWorkoutEvent], Never>()
         
         var paces: [HKWorkoutEvent] = []
         
         guard let distanceType = HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier.distanceWalkingRunning) else {
-            return [].publisher.setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
+            logger.error("Error fetching pace splits for workout starting on \(HKQuantityTypeIdentifier.distanceWalkingRunning.rawValue)")
+            return [].publisher.setFailureType(to: Error.self).eraseToAnyPublisher()
         }
-
+        
         let workoutPredicate = HKQuery.predicateForObjects(from: self)
         
         let startDateSort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         
         var gpsDrops: TimeInterval = 0
-
+        
         /// Query HealthKit's store
-        let query = HKSampleQuery(sampleType: distanceType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [startDateSort]) {
-            
-            (sampleQuery, results, error) -> Void in
+        let query = HKSampleQuery(sampleType: distanceType, predicate: workoutPredicate, limit: HKObjectQueryNoLimit, sortDescriptors: [startDateSort]) { (sampleQuery, results, error) -> Void in
             
             guard let distanceSamples = results as? [HKQuantitySample], !distanceSamples.isEmpty else {
+                logger.debug("Fetched zero samples of \(HKQuantityTypeIdentifier.distanceWalkingRunning.rawValue) types to calculate running splits manually starting on \(self.startDate) until \(self.endDate)")
                 subject.send(paces)
                 subject.send(completion: .finished)
                 return
@@ -176,12 +191,8 @@ extension HKWorkout {
             /// Trick is to stack them up progresively until they stack a full kilometre
             for (index, element) in distanceSamples.enumerated() {
                 
-                if index > 1 {
-                    
-                    if distanceSamples[index].startDate != distanceSamples[index - 1].endDate {
-                        
-                        gpsDrops += distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate)
-                    }
+                if index > 1 && distanceSamples[index].startDate != distanceSamples[index - 1].endDate {
+                    gpsDrops += distanceSamples[index].startDate.timeIntervalSince(distanceSamples[index-1].endDate)
                 }
                 
                 addedDuration += element.startDate.distance(to: element.endDate)
@@ -189,7 +200,7 @@ extension HKWorkout {
                 
                 /// Finished processing a full kilometre
                 if meters >= 1000 {
-
+                    
                     addedDuration = Double(element.endDate.timeIntervalSince(splitIntervalStart)) - gpsDrops
                     
                     /// seconds / meters
@@ -207,13 +218,11 @@ extension HKWorkout {
                     
                     
                     let metadata: [String: Any] = [
-                        
                         "_HKPrivateMetadataSplitActiveDurationQuantity": HKQuantity(unit: HKUnit.second(), doubleValue: addedDuration),
                         "_HKPrivateMetadataSplitDistanceQuantity" : HKQuantity(unit: HKUnit.meter(), doubleValue: meters - remainder),
                         "_HKPrivateMetadataSplitMeasuringSystem": 1
                     ]
                     
-//                    paces.append(Pace(meters: meters - remainder, duration: addedDuration))
                     paces.append(HKWorkoutEvent(type: .segment, dateInterval: DateInterval(start: splitIntervalStart, duration: addedDuration), metadata: metadata))
                     
                     meters = remainder
@@ -226,7 +235,6 @@ extension HKWorkout {
                 if (distanceSamples.count - 1 ) == index {
                     
                     let metadata: [String: Any] = [
-                        
                         "_HKPrivateMetadataSplitActiveDurationQuantity": HKQuantity(unit: HKUnit.second(), doubleValue: addedDuration),
                         "_HKPrivateMetadataSplitDistanceQuantity" : HKQuantity(unit: HKUnit.meter(), doubleValue: meters),
                         "_HKPrivateMetadataSplitMeasuringSystem": 1
@@ -239,45 +247,29 @@ extension HKWorkout {
             subject.send(paces)
             subject.send(completion: .finished)
         }
-    
+        
         HKHealthStore().execute(query)
         
-        return subject.setFailureType(to: HKCombineError.self).eraseToAnyPublisher()
+        return subject.setFailureType(to: Error.self).eraseToAnyPublisher()
     }
 }
 
-/// Relevant data from a HKWorkout including samples
-public struct HKCWorkoutDetails: Hashable, Identifiable {
-    
-    public let id = UUID()
-    /// The actual workout
-    public let workout: HKWorkout
-    /// A sorted array of location samples, across all HKWorkoutRoutes that are part of the workout
-    public let locations: [CLLocation]
-    /// A sorted array of heartrate samples taken during the workout
-    public let heartRate: [HKQuantitySample]
-    
-    public init(workout: HKWorkout, locations: [CLLocation], heartRate: [HKQuantitySample]) {
-        self.workout = workout
-        self.locations = locations
-        self.heartRate = heartRate
-    }
-}
+// MARK: - HKWorkoutRoute
 
-private extension HKWorkoutRoute {
+extension HKWorkoutRoute {
     
     /// Query the `HKWorkoutRoute` associated with an exercise
-    /// Emits an array of `[CLLocation]` if it succeeds
-    var locationsSubject: PassthroughSubject<[CLLocation], HKCombineError> {
+    public var locationsSubject: PassthroughSubject<[CLLocation], Error> {
         
-        let subject = PassthroughSubject<[CLLocation], HKCombineError>()
-
+        let subject = PassthroughSubject<[CLLocation], Error>()
+        
         var workoutLocations: [CLLocation] = []
         
         let query = HKWorkoutRouteQuery(route: self) { (query, locations, done, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(.upstream(error: error!)))
+                logger.error("Error fetching locations points: \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
                 return
             }
             
@@ -287,6 +279,7 @@ private extension HKWorkoutRoute {
             /// Once no more location batches have to be returned the publisher
             /// will be terminated after sending the finished array of locations
             if done {
+                logger.log("Fetched \(workoutLocations.count) locations points for a workout started on \(self.startDate) until \(self.endDate)")
                 subject.send(workoutLocations)
                 subject.send(completion: .finished)
             }
@@ -298,6 +291,8 @@ private extension HKWorkoutRoute {
     }
 }
 
+// MARK: - HKHealthStore
+
 extension HKHealthStore: HKHealthStoreCombine {
     
     /// Perform statistical calculations over a set of samples
@@ -308,18 +303,23 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - endDate: End date range for the query
     ///   - limit: Number of samples to be returned, defaults to `HKObjectQueryNoLimit`
     /// - Returns: Returns a publisher that publishes downstream the query result
-    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<HKStatistics, HKCombineError> {
+    public func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<HKStatistics, Error> {
         
-        let subject = PassthroughSubject<HKStatistics, HKCombineError>()
+        logger.log("Querying HealthKit statistics for type \(type.description) with option \(options.rawValue) from \(startDate) to \(endDate) with a limit of \(limit)")
+        
+        let subject = PassthroughSubject<HKStatistics, Error>()
         
         let predicate = HKStatisticsQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
         
         let query = HKStatisticsQuery(quantityType: type, quantitySamplePredicate: predicate, options: options, completionHandler: { (query, statistics, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
+                logger.error("Error fetching statistics \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
                 return
             }
+            
+            logger.log("Successfully fetched statistics sample with a value of \(statistics!, privacy: .private)")
             
             subject.send(statistics!)
             subject.send(completion: .finished)
@@ -337,18 +337,25 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - end: End range of the sample query.
     ///   - limit: Integer limiting the number of samples to be returned.
     /// - Returns: A publisher containing an array of the requested samples.
-    public func get<T>(sample: T, start: Date, end: Date, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKQuantitySample], HKCombineError> where T: HKObjectType {
+    public func get<T>(sample: T, start: Date, end: Date, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKQuantitySample], Error> where T: HKObjectType {
         
-        let subject = PassthroughSubject<[HKQuantitySample], HKCombineError>()
+        let subject = PassthroughSubject<[HKQuantitySample], Error>()
         
         let sampleType = HKSampleType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: sample.identifier))!
-
+        
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end)
         
         let query = HKSampleQuery(sampleType: sampleType, predicate: predicate, limit: limit, sortDescriptors: nil, resultsHandler: { (query, samples, error) in
             
+            guard error == nil else {
+                logger.error("Error fetching samples of type \(sample.description) from \(start) to \(end) with a limit of \(limit): \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
+                return
+            }
+            
             let samples = samples as? [HKQuantitySample] ?? []
             
+            logger.log("Successfully fetched \(samples.count) samples of type \(sample.description) from \(start) to \(end) with a limit of \(limit)")
             subject.send(samples)
             subject.send(completion: .finished)
         })
@@ -358,39 +365,43 @@ extension HKHealthStore: HKHealthStoreCombine {
         return subject.eraseToAnyPublisher()
     }
     
-    /// Requests permission to save and read the specified data types
+    /// Requests permission to save and read the specified data types.
+    /// It is important to request authorization before querying any health data.
+    /// Users can change permissions at any time and apps aren't notified of these changes.
     /// - Parameters:
     ///   - toShare: Set containing the data types to share.
     ///   - toRead: Set containing the data types to read.
     /// - Returns: A publisher that emits a `Bool` when the authorization process finishes
-    public func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> AnyPublisher<Bool, HKCombineError> {
+    public func requestAuthorization(toShare: Set<HKSampleType>?, toRead: Set<HKSampleType>?) -> Deferred<Future<Bool, Error>> {
         
-        let subject = PassthroughSubject<Bool, HKCombineError>()
-        
-        /// - `Bool`: Indicates whether the request was processed successfully. Doesn't indicate whether the
-        ///          permission was actually granted.
-        /// - `Error`:  `nil` if an error hasn't ocurred
-        let callback: (Bool, Error?) -> () = { result, error in
+        /**
+         Use a deferred Future to wrap a one-time authorization request.
+         To avoid the `Future` to be executed immediately wrap it with a `Defered` publisher so it will only
+         be executed when a subscriber is attached.
+         */
+        Deferred {
             
-            guard error == nil else {
-                return subject.send(completion: .failure(.upstream(error: error!)))
+            Future { [unowned self] promise in
+                
+                logger.log("Started to request permissions to share \(ListFormatter().string(from: Array(toShare ?? []).map({ $0.description })) ?? "empty") and to read \(ListFormatter().string(from: Array(toRead ?? []).map({ $0.description })) ?? "empty")")
+                
+                
+                guard HKHealthStore.isHealthDataAvailable() else {
+                    promise(.success(true))
+                    return
+                }
+                
+                self.requestAuthorization(toShare: toShare, read: toRead) { authSuccess, error in
+                    guard error == nil else {
+                        logger.fault("HealthKit authorization error: \(error!.localizedDescription)")
+                        promise(.success(false))
+                        return
+                    }
+                    
+                    promise(.success(authSuccess))
+                }
             }
-            
-            subject.send(result)
-            subject.send(completion: .finished)
         }
-        
-        guard HKHealthStore.isHealthDataAvailable() else {
-            callback(false, nil)
-            return subject.eraseToAnyPublisher()
-        }
-        
-        self.requestAuthorization(toShare: toShare, read: toRead) { (result, error) in
-            /// Won't be called until the system's HealthKit permission has ended
-            callback(result, error)
-        }
-        
-        return subject.eraseToAnyPublisher()
     }
     
     /// Checks whether the system presents the user with a permission sheet if your app requests authorization for the provided types.
@@ -398,32 +409,67 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - toShare: Set containing the data types to share.
     ///   - toRead: Set containing the data types to read.
     /// - Returns: `true` if it needs to request permissions for the given `types`, otherwise `false`.
-    public func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> AnyPublisher<Bool, HKCombineError> {
+    public func needsAuthorization(toShare: Set<HKSampleType>, toRead: Set<HKSampleType>) -> Deferred<Future<Bool, Error>> {
         
-        let subject = PassthroughSubject<Bool, HKCombineError>()
+        /**
+         Use a deferred Future to wrap a one-time authorization request.
+         To avoid the `Future` to be executed immediately wrap it with a `Defered` publisher so it will only
+         be executed when a subscriber is attached.
+         */
+        Deferred {
+            
+            Future { [unowned self] promise in
+                
+                guard HKHealthStore.isHealthDataAvailable() else {
+                    promise(.success(true))
+                    return
+                }
+                
+                getRequestStatusForAuthorization(toShare: toShare , read: toRead) { (result, error) in
+                    
+                    guard error == nil else {
+                        logger.error("Error requesting the user for the HealthKit permission sheet \(error!.localizedDescription)")
+                        promise(.success(false))
+                        return
+                    }
+
+                    promise(.success(result == .shouldRequest))
+                }
+            }
+        }
+    }
+    
+    public func workouts(id: UUID, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], Error> {
         
-        let callback: (HKAuthorizationRequestStatus, Error?) -> () = { result, error in
+        let subject = PassthroughSubject<[HKWorkout], Error>()
+        
+        let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+        
+        let workoutPredicate = HKQuery.predicateForObject(with: id)
+        
+        let compoundPredicate = NSCompoundPredicate(andPredicateWithSubpredicates: [workoutPredicate])
+        
+        let query = HKSampleQuery(sampleType: .workoutType(),
+                                  predicate: compoundPredicate,
+                                  limit: limit,
+                                  sortDescriptors: [sortDescriptor]) { (query, samples, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
-                return
+                logger.error("Error trying to fetch \(error!.localizedDescription)")
+                return subject.send(completion: .failure(error!))
             }
             
-            subject.send(result == .shouldRequest)
+            
+            let workouts: [HKWorkout] = (samples as? [HKWorkout]) ?? []
+            
+            subject.send(workouts)
             subject.send(completion: .finished)
         }
         
-        guard HKHealthStore.isHealthDataAvailable() else {
-            return Fail(error: HKCombineError.noHKAvailable).eraseToAnyPublisher()
-        }
-        
-        getRequestStatusForAuthorization(toShare: toShare , read: toRead) { (result, error) in
-            callback(result, error)
-        }
+        self.execute(query)
         
         return subject.eraseToAnyPublisher()
     }
-    
     
     /// Query workouts from a type in a date range
     /// - Parameters:
@@ -432,9 +478,9 @@ extension HKHealthStore: HKHealthStoreCombine {
     ///   - endDate: End date range to perform the query
     ///   - limit: Limits the number of values to be returned, defaults to `HKObjectQueryNoLimit`
     /// - Returns: Publisher that emits an array of `HKWorkout`.
-    public func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], HKCombineError> {
+    public func workouts(type: HKWorkoutActivityType, from startDate: Date, to endDate: Date, limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], Error> {
         
-        let subject = PassthroughSubject<[HKWorkout], HKCombineError>()
+        let subject = PassthroughSubject<[HKWorkout], Error>()
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         
@@ -450,13 +496,13 @@ extension HKHealthStore: HKHealthStoreCombine {
                                   sortDescriptors: [sortDescriptor]) { (query, samples, error) in
             
             guard error == nil else {
-                return subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
-            }
-            
-            guard let workouts = samples as? [HKWorkout] else {
-                subject.send(completion: .failure(HKCombineError.noWorkoutsFound))
+                logger.error("Error trying to fetch \(limit) \(type.rawValue) workouts from \(startDate) to \(endDate): \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
                 return
             }
+            
+            
+            let workouts: [HKWorkout] = (samples as? [HKWorkout]) ?? []
             
             subject.send(workouts)
             subject.send(completion: .finished)
@@ -467,24 +513,16 @@ extension HKHealthStore: HKHealthStoreCombine {
         return subject.eraseToAnyPublisher()
     }
     
-    
-    /// Given a `HKWorkout` retrieve heart rate and `HKWorkoutRoute` values in a `HKCWorkoutDetails` containing both of them.
-    /// - Parameter workout: `HKWorkout` to get the information from
-    /// - Returns: Publisher that emits a single `HKCWorkouDetails` object with the associated data
-    fileprivate func workoutDetails(_ workout: HKWorkout) -> AnyPublisher<HKCWorkoutDetails, HKCombineError> {
-        return workout.workoutWithDetails
-    }
-      
     /// Query workout samples
     /// - Parameters:
     ///   - type: `HKWorkoutActivityType` to query workouts for
     ///   - limit: `Int` to limit the number of workouts to be returned, defaults to `HKObjectQueryNoLimit
     /// - Returns: Publisher that emits an array of `HWorkout`
-    public func workouts(type: HKWorkoutActivityType, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], HKCombineError> {
-        let subject = PassthroughSubject<[HKWorkout], HKCombineError>()
+    public func workouts(type: HKWorkoutActivityType, _ limit: Int = HKObjectQueryNoLimit) -> AnyPublisher<[HKWorkout], Error> {
         
-        let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate,
-                                              ascending: false)
+        let subject = PassthroughSubject<[HKWorkout], Error>()
+        
+        let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         
         let workoutPredicate = HKQuery.predicateForWorkouts(with: type)
         
@@ -494,14 +532,14 @@ extension HKHealthStore: HKHealthStoreCombine {
                                   sortDescriptors: [sortDescriptor]) { (query, samples, error) in
             
             guard error == nil else {
-                subject.send(completion: .failure(HKCombineError.upstream(error: error!)))
-                return
-            }
-            guard let workouts = samples as? [HKWorkout] else {
-                subject.send(completion: .failure(HKCombineError.noWorkoutsFound))
+                logger.error("Error trying to fetch \(limit) \(type.rawValue) workouts: \(error!.localizedDescription)")
+                subject.send(completion: .failure(error!))
                 return
             }
             
+            let workouts: [HKWorkout] = (samples as? [HKWorkout]) ?? []
+            
+            logger.log("Fetched \(workouts.count) of type \(type.rawValue) with a limit of \(limit)")
             subject.send(workouts)
             subject.send(completion: .finished)
         }
