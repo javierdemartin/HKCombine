@@ -28,7 +28,9 @@ private protocol HKHealthStoreCombine {
     
     func statistic(for type: HKQuantityType, with options: HKStatisticsOptions, from startDate: Date, to endDate: Date, _ limit: Int) -> AnyPublisher<HKStatistics, Error>
     
-    func workouts(id: UUID, limit: Int) -> AnyPublisher<[HKWorkout], Error> 
+    func workouts(id: UUID, limit: Int) -> AnyPublisher<[HKWorkout], Error>
+    
+    func series<T>(type: T, startDate: Date, endDate: Date) -> AnyPublisher<[HKQuantity], Error> where T: HKObjectType
 }
 
 /// Relevant data from a HKWorkout including samples
@@ -294,6 +296,33 @@ extension HKWorkoutRoute {
 // MARK: - HKHealthStore
 
 extension HKHealthStore: HKHealthStoreCombine {
+    
+    public func series<T>(type: T, startDate: Date, endDate: Date) -> AnyPublisher<[HKQuantity], Error> where T: HKObjectType {
+        
+        let subject = PassthroughSubject<[HKQuantity], Error>()
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate)
+        
+        var samples: [HKQuantity] = []
+
+        let query = HKQuantitySeriesSampleQuery(quantityType: type as! HKQuantityType, predicate: predicate, quantityHandler: { (query, quantity, dateInterval, quantitySample, done, error) in
+            
+            if quantity != nil {
+                samples.append(quantity!)
+            }
+            
+            if done {
+                subject.send(samples)
+            }
+            
+        })
+        
+        query.includeSample = false
+        
+        execute(query)
+        
+        return subject.eraseToAnyPublisher()
+    }
     
     /// Perform statistical calculations over a set of samples
     /// - Parameters:
